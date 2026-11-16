@@ -1,5 +1,3 @@
-const memos = new Map();
-const uploads = new Map();
 const authorizationCodes = new Map();
 const clients = new Map();
 
@@ -126,17 +124,30 @@ function bytesFromBase64(value) {
   return Uint8Array.from(binary, (character) => character.charCodeAt(0));
 }
 
-async function callTool(name, args, request) {
+async function storageFetch(env, pathname, init) {
+  if (!env.STORAGE) throw new Error("Persistent storage is not configured.");
+  const id = env.STORAGE.idFromName("default");
+  return env.STORAGE.get(id).fetch(`https://storage${pathname}`, init);
+}
+
+async function callTool(name, args, request, env) {
   if (name === "memo_write") {
     if (typeof args?.text !== "string" || !args.text) throw new Error("text is required");
     const id = crypto.randomUUID();
-    memos.set(id, { id, text: args.text, createdAt: new Date().toISOString() });
+    const memo = { id, text: args.text, createdAt: new Date().toISOString() };
+    const response = await storageFetch(env, "/memo/write", {
+      method: "POST",
+      body: JSON.stringify(memo),
+    });
+    if (!response.ok) throw new Error("Could not save memo.");
     return { id };
   }
 
   if (name === "memo_search") {
-    const query = String(args?.query ?? "").toLocaleLowerCase();
-    return { notes: [...memos.values()].filter((memo) => memo.text.toLocaleLowerCase().includes(query)) };
+    const query = String(args?.query ?? "");
+    const response = await storageFetch(env, `/memo/search?query=${encodeURIComponent(query)}`);
+    if (!response.ok) throw new Error("Could not search memos.");
+    return response.json();
   }
 
   if (name === "upload") {
@@ -155,8 +166,17 @@ async function callTool(name, args, request) {
     }
     const id = `${Date.now()}-${crypto.randomUUID()}`;
     const safeName = args.filename.replace(/[^a-zA-Z0-9._-]/g, "_");
-    uploads.set(`${id}-${safeName}`, { bytes, mimeType: args.mimeType || "application/octet-stream" });
-    return { url: `${origin(request)}/files/${encodeURIComponent(`${id}-${safeName}`)}` };
+    const key = `${id}-${safeName}`;
+    const response = await storageFetch(env, "/file", {
+      method: "POST",
+      body: JSON.stringify({
+        key,
+        data: base64(bytes),
+        mimeType: args.mimeType || "application/octet-stream",
+      }),
+    });
+    if (!response.ok) throw new Error("Could not store file.");
+    return { url: `${origin(request)}/files/${encodeURIComponent(key)}` };
   }
 
   if (name === "transcribe") {
@@ -165,8 +185,22 @@ async function callTool(name, args, request) {
     if (!response.ok) throw new Error(`Could not fetch audio: HTTP ${response.status}`);
     const type = response.headers.get("content-type") || "";
     const body = await response.arrayBuffer();
-    const text = type.includes("text") || type.includes("json") ? new TextDecoder().decode(body).trim() : "";
-    return { segments: [{ start: 0, text: text || "Audio received. No speech-to-text provider is configured." }] };
+    if (!type.startsWith("audio/") && !/\.(mp3|wav|m4a|ogg|webm|flac)(?:\?|$)/i.test(args.url)) {
+      throw new Error("The URL did not return audio content.");
+    }
+    if (!env.AI) throw new Error("Speech-to-text is not configured.");
+    const transcription = await env.AI.run("@cf/openai/whisper", {
+      audio: [...new Uint8Array(body)],
+    });
+    const segments = (transcription.segments || [])
+      .map((segment) => ({
+        start: Number(segment.start ?? segment.start_time ?? 0),
+        text: String(segment.text ?? "").trim(),
+      }))
+      .filter((segment) => segment.text);
+    if (!segments.length && transcription.text) segments.push({ start: 0, text: String(transcription.text).trim() });
+    if (!segments.length) throw new Error("The audio produced no transcript.");
+    return { segments };
   }
 
   throw new Error(`Unknown tool: ${name}`);
@@ -196,12 +230,39 @@ async function handleMcp(request, env) {
       },
     });
   }
+  if (body.method === "server/discover") {
+    return json({
+      jsonrpc: "2.0",
+      id: body.id,
+      result: {
+        resultType: "complete",
+        supportedVersions: ["2026-07-28", "2025-06-18"],
+        capabilities: { tools: {} },
+        _meta: {
+          "io.modelcontextprotocol/serverInfo": {
+            name: "s02e03-remote-mcp",
+            version: "1.0.0",
+          },
+        },
+        instructions: "This server provides memo, upload, and transcription tools.",
+        ttlMs: 3600000,
+        cacheScope: "public",
+      },
+    });
+  }
   if (body.method === "tools/list") return json({ jsonrpc: "2.0", id: body.id, result: { tools } });
   if (body.method === "tools/call") {
     try {
-      return json(result(body.id, await callTool(body.params?.name, body.params?.arguments || {}, request)));
+      return json(result(body.id, await callTool(body.params?.name, body.params?.arguments || {}, request, env)));
     } catch (caught) {
-      return json({ ...error(body.id, -32000, caught instanceof Error ? caught.message : String(caught)), result: undefined });
+      return json({
+        jsonrpc: "2.0",
+        id: body.id,
+        result: {
+          isError: true,
+          content: [{ type: "text", text: caught instanceof Error ? caught.message : String(caught) }],
+        },
+      });
     }
   }
   return json(error(body.id, -32601, `Method not found: ${body.method}`));
@@ -291,10 +352,47 @@ export default {
     }
     if (url.pathname.startsWith("/oauth/")) return handleOAuth(request, env);
     if (url.pathname.startsWith("/files/") && request.method === "GET") {
-      const stored = uploads.get(decodeURIComponent(url.pathname.slice("/files/".length)));
-      return stored ? new Response(stored.bytes, { headers: { "content-type": stored.mimeType } }) : json({ error: "not found" }, 404);
+      const key = encodeURIComponent(decodeURIComponent(url.pathname.slice("/files/".length)));
+      return storageFetch(env, `/file/${key}`);
     }
     if (url.pathname === "/mcp") return handleMcp(request, env);
     return json({ error: "not found" }, 404);
   },
 };
+
+export class StorageDO {
+  constructor(state) {
+    this.storage = state.storage;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/memo/write" && request.method === "POST") {
+      const memo = await request.json();
+      await this.storage.put(`memo:${memo.id}`, memo);
+      return json({ ok: true });
+    }
+
+    if (url.pathname === "/memo/search" && request.method === "GET") {
+      const query = (url.searchParams.get("query") || "").toLocaleLowerCase();
+      const entries = await this.storage.list({ prefix: "memo:" });
+      const notes = [...entries.values()].filter((memo) => memo.text.toLocaleLowerCase().includes(query));
+      return json({ notes });
+    }
+
+    if (url.pathname === "/file" && request.method === "POST") {
+      const file = await request.json();
+      await this.storage.put(`file:${file.key}`, file);
+      return json({ ok: true });
+    }
+
+    if (url.pathname.startsWith("/file/") && request.method === "GET") {
+      const file = await this.storage.get(`file:${decodeURIComponent(url.pathname.slice("/file/".length))}`);
+      if (!file) return json({ error: "not found" }, 404);
+      return new Response(bytesFromBase64(file.data), { headers: { "content-type": file.mimeType } });
+    }
+
+    return json({ error: "not found" }, 404);
+  }
+}
