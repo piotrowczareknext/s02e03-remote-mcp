@@ -57,7 +57,7 @@ function unauthorized(res, metadataUrl) {
     res,
     401,
     { error: "unauthorized" },
-    { "www-authenticate": `Bearer resource_metadata="${metadataUrl}"` },
+    { "WWW-Authenticate": `Bearer resource_metadata="${metadataUrl}"` },
   );
 }
 
@@ -258,7 +258,7 @@ const server = createServer(async (req, res) => {
         authorization_servers: [origin],
         bearer_methods_supported: ["header"],
         scopes_supported: ["mcp"],
-      });
+      }, { "content-type": "application/json" });
     }
 
     if (requestUrl.pathname === "/.well-known/oauth-authorization-server") {
@@ -271,7 +271,7 @@ const server = createServer(async (req, res) => {
         grant_types_supported: ["authorization_code"],
         code_challenge_methods_supported: ["S256"],
         scopes_supported: ["mcp"],
-      });
+      }, { "content-type": "application/json" });
     }
 
     if (requestUrl.pathname === "/oauth/register" && req.method === "POST") {
