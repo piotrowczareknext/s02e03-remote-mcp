@@ -14,7 +14,9 @@ const uploadDir = path.join(dataDir, "uploads");
 const memoFile = path.join(dataDir, "memos.json");
 const port = Number(process.env.PORT || 3000);
 const configuredBaseUrl = process.env.BASE_URL?.replace(/\/+$/, "");
-const authToken = process.env.AUTH_TOKEN;
+const authToken = process.env.AUTH_TOKEN || randomUUID();
+const authorizationCodes = new Map();
+const oauthClients = new Map();
 
 await fs.mkdir(uploadDir, { recursive: true });
 
@@ -64,6 +66,28 @@ async function readRequestBody(req) {
   for await (const chunk of req) chunks.push(chunk);
   const text = Buffer.concat(chunks).toString("utf8");
   return text ? JSON.parse(text) : undefined;
+}
+
+async function readTextBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+function htmlEscape(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function oauthRedirect(params, code) {
+  const redirect = new URL(params.redirect_uri);
+  redirect.searchParams.set("code", code);
+  if (params.state) redirect.searchParams.set("state", params.state);
+  return redirect.toString();
 }
 
 function textContent(value) {
@@ -224,12 +248,105 @@ const server = createServer(async (req, res) => {
 <p>Authentication uses a bearer token when configured. Uploaded files are served from <code>/files/</code>.</p>`);
     }
 
-    if (requestUrl.pathname === "/.well-known/oauth-protected-resource") {
+    if (
+      requestUrl.pathname === "/.well-known/oauth-protected-resource" ||
+      requestUrl.pathname === "/.well-known/oauth-protected-resource/mcp"
+    ) {
       return jsonResponse(res, 200, {
         resource: `${origin}/mcp`,
         resource_documentation: `${origin}/docs`,
+        authorization_servers: [origin],
         bearer_methods_supported: ["header"],
         scopes_supported: ["mcp"],
+      });
+    }
+
+    if (requestUrl.pathname === "/.well-known/oauth-authorization-server") {
+      return jsonResponse(res, 200, {
+        issuer: origin,
+        authorization_endpoint: `${origin}/oauth/authorize`,
+        token_endpoint: `${origin}/oauth/token`,
+        registration_endpoint: `${origin}/oauth/register`,
+        response_types_supported: ["code"],
+        grant_types_supported: ["authorization_code"],
+        code_challenge_methods_supported: ["S256"],
+        scopes_supported: ["mcp"],
+      });
+    }
+
+    if (requestUrl.pathname === "/oauth/register" && req.method === "POST") {
+      const registration = await readRequestBody(req);
+      const clientId = randomUUID();
+      oauthClients.set(clientId, registration || {});
+      return jsonResponse(res, 201, {
+        client_id: clientId,
+        client_id_issued_at: Math.floor(Date.now() / 1000),
+        token_endpoint_auth_method: "none",
+      });
+    }
+
+    if (requestUrl.pathname === "/oauth/authorize") {
+      const params =
+        req.method === "GET"
+          ? Object.fromEntries(requestUrl.searchParams)
+          : Object.fromEntries(new URLSearchParams(await readTextBody(req)));
+      if (!params.redirect_uri) {
+        return jsonResponse(res, 400, { error: "redirect_uri is required" });
+      }
+
+      if (req.method === "GET") {
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+        return res.end(`<!doctype html>
+<meta charset="utf-8">
+<title>Authorize MCP access</title>
+<h1>Authorize MCP access</h1>
+<p>Allow the course to use this MCP server?</p>
+<form method="post" action="/oauth/authorize">
+${Object.entries(params)
+  .map(([key, value]) => `<input type="hidden" name="${htmlEscape(key)}" value="${htmlEscape(value)}">`)
+  .join("\n")}
+<button type="submit">Allow access</button>
+</form>`);
+      }
+
+      const code = randomUUID();
+      authorizationCodes.set(code, {
+        clientId: params.client_id,
+        redirectUri: params.redirect_uri,
+        codeChallenge: params.code_challenge,
+        expiresAt: Date.now() + 5 * 60 * 1000,
+      });
+      res.writeHead(302, { location: oauthRedirect(params, code), "cache-control": "no-store" });
+      return res.end();
+    }
+
+    if (requestUrl.pathname === "/oauth/token" && req.method === "POST") {
+      const params = Object.fromEntries(new URLSearchParams(await readTextBody(req)));
+      const authorization = authorizationCodes.get(params.code);
+      if (
+        !authorization ||
+        authorization.expiresAt < Date.now() ||
+        authorization.clientId !== params.client_id ||
+        authorization.redirectUri !== params.redirect_uri
+      ) {
+        return jsonResponse(res, 400, { error: "invalid_grant" });
+      }
+
+      if (authorization.codeChallenge) {
+        const verifierHash = createHash("sha256")
+          .update(params.code_verifier || "")
+          .digest("base64url");
+        if (verifierHash !== authorization.codeChallenge) {
+          return jsonResponse(res, 400, { error: "invalid_grant" });
+        }
+      }
+
+      authorizationCodes.delete(params.code);
+      return jsonResponse(res, 200, {
+        access_token: authToken,
+        token_type: "Bearer",
+        expires_in: 3600,
+        scope: "mcp",
       });
     }
 
