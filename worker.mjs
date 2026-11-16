@@ -182,7 +182,7 @@ async function callTool(name, args, request, env) {
   if (name === "transcribe") {
     if (typeof args?.url !== "string") throw new Error("url is required");
     const response = await fetch(args.url);
-    if (!response.ok) throw new Error(`Could not fetch audio: HTTP ${response.status}`);
+    if (!response.ok) throw new Error(`Could not fetch audio from ${args.url}: HTTP ${response.status}`);
     const type = response.headers.get("content-type") || "";
     const body = await response.arrayBuffer();
     if (!type.startsWith("audio/") && !/\.(mp3|wav|m4a|ogg|webm|flac)(?:\?|$)/i.test(args.url)) {
@@ -195,10 +195,15 @@ async function callTool(name, args, request, env) {
     const segments = (transcription.segments || [])
       .map((segment) => ({
         start: Number(segment.start ?? segment.start_time ?? 0),
-        text: String(segment.text ?? "").trim(),
+        text: String(segment.text ?? "").trim().replace(/\b([01]?\d|2[0-3])([0-5]\d)\b/g, "$1:$2"),
       }))
       .filter((segment) => segment.text);
-    if (!segments.length && transcription.text) segments.push({ start: 0, text: String(transcription.text).trim() });
+    if (!segments.length && transcription.text) {
+      segments.push({
+        start: 0,
+        text: String(transcription.text).trim().replace(/\b([01]?\d|2[0-3])([0-5]\d)\b/g, "$1:$2"),
+      });
+    }
     if (!segments.length) throw new Error("The audio produced no transcript.");
     return { segments };
   }
